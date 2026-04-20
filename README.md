@@ -1,4 +1,3 @@
-<<<<<<< HEAD
 ## 🧠 The Standard PyTorch Deep Learning Workflow
 
 Every PyTorch project, whether it's recognizing digits or generating text, follows this exact same 7-step pipeline.
@@ -73,7 +72,7 @@ criterion = nn.CrossEntropyLoss() # Standard for classification
 optimizer = optim.Adam(model.parameters(), lr=0.001)
 ```
 
-### 5.The Training Loop
+### 5. The Training Loop
 The core process where learning happens. The 5-step sequence inside the batch loop is mandatory.
 ```python
 epochs = 5
@@ -121,7 +120,7 @@ with torch.no_grad():
 print(f'Accuracy: {100 * correct / total:.2f}%')
 ```
 
-### 7.Save and Load the Model
+### 7. Save and Load the Model
 Save only the learned weights (state_dict) rather than the entire object for better compatibility.
 ```python
 # --- Save ---
@@ -133,4 +132,4 @@ model.load_state_dict(torch.load("model_weights.pth", weights_only=True))
 model.to(device)
 model.eval()
 ```
->>>>>>> 9aa47a80e00658fa412a6153f947bdc1b69f99ad
+
