@@ -133,3 +133,127 @@ model.to(device)
 model.eval()
 ```
 
+# ⚡ PyTorch Lightning + Optuna Optimization Workflow
+
+This document outlines the standard architecture for combining **PyTorch Lightning** (for boilerplate-free training) and **Optuna** (for automated hyperparameter tuning). 
+
+This template uses internal scaling (`nn.BatchNorm1d`) and tracks validation loss to find the perfect learning rate and layer sizes. Copy and paste this as a starting point for your advanced optimization projects.
+
+---
+
+### Step 1: Data Preparation
+Prepare your raw data and wrap it in PyTorch DataLoaders. Because our model handles its own scaling, we do not use `scikit-learn` scalers here.
+
+1. Load Raw Data (Using Class Dataset)
+2. Split Data (Train / Validation / Test)
+3. Create DataLoaders
+
+### Step 2: The Parameterized Lightning Module
+Define your model so it accepts the hyperparameters you want Optuna to search for. Crucially, log the validation metric so Optuna can read it later.
+
+```python
+class LitNet(pl.LightningModule):
+    def __init__(self, Ni, Nh1, Nh2, No):
+        """
+        Ni - Input size
+        Nh1 - Neurons in the 1st hidden layer
+        Nh2 - Neurons in the 2nd hidden layer
+        No - Output size
+        """
+        super().__init__()
+
+        print('Network initialized')
+        self.net = nn.Sequential(nn.Linear(in_features=Ni, out_features=Nh1),
+                       nn.Sigmoid(),
+                       nn.Linear(in_features=Nh1, out_features=Nh2),
+                       nn.Sigmoid(),
+                       nn.Linear(in_features=Nh2, out_features=No))
+        self.val_loss = []
+        self.train_loss = []
+
+    # Forward step defines how the LightningModule behaves during inference/prediction.
+    def forward(self, x, additional_out=False):
+        return self.net(x)
+
+    # Training_step defines the training loop.
+    def training_step(self, batch, batch_idx=None):
+        # training_step defines the train loop. It is independent of forward
+        x_batch = batch[0]
+        label_batch = batch[1]
+        out = self.net(x_batch)
+        loss = F.binary_cross_entropy_with_logits(out, label_batch)
+        self.train_loss.append(loss.item())
+        return loss
+
+    def validation_step(self, batch, batch_idx=None):
+        # validation_step defines the validation loop. It is independent of forward
+        x_batch = batch[0]
+        label_batch = batch[1]
+        out = self.net(x_batch)
+        loss = F.binary_cross_entropy_with_logits(out, label_batch)
+        self.val_loss.append(loss.item())
+        self.log("val_loss", loss.item(), prog_bar=True)
+
+    def configure_optimizers(self):
+        optimizer = optim.Adam(self.net.parameters(), lr=1e-2)
+        return optimizer
+```
+### Step 3: The Optuna Objective Function
+This function tells Optuna how to generate hyperparameters, how to build the Trainer, and what score to use to evaluate success.
+```python
+def objective(trial):
+
+    # We optimize the number of hidden units in each layer.
+    output_dims = [
+        trial.suggest_int("n_units_l{}".format(i), 64, 256, log=True) for i in range(2)
+    ]_dims
+
+    model = LitNet(Ni, output_dims[0], output_dims[1], No)
+
+    trainer = pl.Trainer(devices=1, max_epochs=20, val_check_interval=1,
+                         log_every_n_steps=1)
+    hyperparameters = dict(output_dims=output_dims)
+    trainer.logger.log_hyperparams(hyperparameters)
+    trainer.fit(model, train_dataloader, val_dataloader)
+    return trainer.callback_metrics["val_loss"].item()
+```
+
+### Step 4: Run the Study
+```python
+pruner = optuna.pruners.NopPruner()
+# print(pruner) <optuna.pruners._nop.NopPruner object at 0x7f4c2466ed50>
+# print(type(pruner)) <class 'optuna.pruners._nop.NopPruner'>
+
+study = optuna.create_study(study_name="myfirstoptimizationstudy", direction="minimize", pruner=pruner)
+study.optimize(objective, n_trials=3, timeout=300)
+
+print("Number of finished trials: {}".format(len(study.trials)))
+
+print("Best trial:")
+trial = study.best_trial
+
+print("  Value: {}".format(trial.value))
+
+print("  Params: ")
+for key, value in trial.params.items():
+    print("    {}: {}".format(key, value))
+```
+
+# A little reminder for my self
+```python
+from sklearn.preprocessing import StandardScaler
+
+# 1. Split the raw, unscaled data FIRST
+X_train, X_val, X_test = split_my_data(X)
+
+# 2. Initialize the Scaler
+scaler = StandardScaler()
+
+# 3. FIT (learn the math) ONLY on the Training data!
+scaler.fit(X_train) 
+
+# 4. TRANSFORM (apply the math) to all three datasets
+X_train_scaled = scaler.transform(X_train)
+X_val_scaled = scaler.transform(X_val)
+X_test_scaled = scaler.transform(X_test)
+```
