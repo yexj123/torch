@@ -1,3 +1,20 @@
+import torch
+import torch.nn as nn
+import pandas as pd
+from torchvision import transforms
+from torch.utils.data import DataLoader, Dataset, random_split
+from collections import Counter
+import random
+SHARED_LABEL_MAP = {
+    'E': 0, # Empty Room
+    'W': 1, # Walking
+    'R': 2, # Running
+    'J': 3, # Jumping
+    'L': 4, # Sitting Still
+    'S': 5, # Standing Still
+    'C': 6, # Sitting down / Standing up transition
+    'H': 7  # (H is often used for the same arm gym activity)
+}
 import os
 import numpy as np
 import torch
@@ -5,43 +22,36 @@ from torch.utils.data import Dataset
 
 class OPERAnetDataset(Dataset):
     def __init__(self, root_dir, subjects_to_include=None, window_size=340, step_size=170, transform=None):
-        """
-        subjects_to_include: List of strings like ['S1', 'S2', 'S5'] 
-                             If None, includes all subjects.
-        """
         self.samples = []
         self.transform = transform
-        self.label_map = {'W': 0, 'S': 1, 'T': 2, 'L': 3, 'B': 4, 'F': 5, 'X': 6}
+        self.label_map = SHARED_LABEL_MAP
 
-        print(f"Loading data for subjects: {subjects_to_include if subjects_to_include else 'ALL'}...")
+        # Use a temporary list to store paths first
+        print(f"Pre-loading data into RAM...")
         
         for root, _, files in os.walk(root_dir):
-            # Extract Subject ID from folder name (e.g., 'S7a' -> 'S7')
             folder_name = os.path.basename(root)
-            subject_id = folder_name[:2] # Gets 'S1', 'S7', etc.
-
-            # Step 1: Logic for Subject-Based Splitting
+            subject_id = folder_name[:2]
             if subjects_to_include is not None and subject_id not in subjects_to_include:
                 continue
 
             for file in files:
                 if file.endswith(".txt"):
                     try:
-                        code = file.split('_')[1].upper()
+                        code = file.split('_')[1][0].upper()
                         if code in self.label_map:
                             file_path = os.path.join(root, file)
+                            # LOAD THE ENTIRE FILE INTO RAM NOW
                             data = np.load(file_path, allow_pickle=True).astype(np.float32)
-                            length = data.shape[0]
                             label = self.label_map[code]
                             
-                            for start in range(0, length - window_size + 1, step_size):
-                                end = start + window_size
-                                window = data[start:end, :] 
+                            for start in range(0, data.shape[0] - window_size + 1, step_size):
+                                # Slice and store the actual array, not the path
+                                window = data[start : start + window_size, :]
                                 self.samples.append((window, label))
                     except Exception:
                         continue
-        
-        print(f"Loaded {len(self.samples)} windows.")
+        print(f"Loaded {len(self.samples)} windows into RAM.")
 
     def __len__(self):
         return len(self.samples)
@@ -57,49 +67,34 @@ class OPERAnetDataset(Dataset):
         tensor_y = torch.tensor(label, dtype=torch.long)
         return tensor_x, tensor_y
 
-import random
 
 class WirelessAugment:
     def __init__(self, time_mask_max=30, freq_mask_max=10, p=0.5):
         self.time_mask_max = time_mask_max
         self.freq_mask_max = freq_mask_max
-        self.p = p # Probability of applying augmentation
+        self.p = p
 
     def __call__(self, x):
-        """
-        x: numpy array of shape (340, 100) -> (Time, Velocity/Freq)
-        """
-        if random.random() > self.p:
-            return x
+        # Apply random noise/masking only with probability p
+        if random.random() < self.p:
+            # 1. Gaussian Noise
+            x = x + np.random.normal(0, 0.01, x.shape).astype(np.float32)
+            # 2. Time Mask
+            t = np.random.randint(0, self.time_mask_max)
+            t0 = np.random.randint(0, x.shape[0] - t)
+            x[t0:t0+t, :] = 0
+            # 3. Freq Mask
+            f = np.random.randint(0, self.freq_mask_max)
+            f0 = np.random.randint(0, x.shape[1] - f)
+            x[:, f0:f0+f] = 0
 
-        # 1. Add Gaussian Noise (Simulates hardware thermal noise)
-        noise = np.random.normal(0, 0.01, x.shape).astype(np.float32)
-        x = x + noise
-
-        # 2. Time Masking (Simulates packet loss / brief signal blockage)
-        # Masks a vertical strip across all velocity bins
-        t = np.random.randint(0, self.time_mask_max)
-        t0 = np.random.randint(0, x.shape[0] - t)
-        x[t0:t0+t, :] = 0
-
-        # 3. Frequency Masking (Simulates static multipath interference)
-        # Masks a horizontal strip across all time frames
-        f = np.random.randint(0, self.freq_mask_max)
-        f0 = np.random.randint(0, x.shape[1] - f)
-        x[:, f0:f0+f] = 0
-
-        # 4. Global Normalization (Crucial for Environment Independence)
-        # Normalizes the window so the model looks at movement patterns, not raw power
+        # ALWAYS NORMALIZE (Keep this outside the if-block)
         x = (x - np.mean(x)) / (np.std(x) + 1e-8)
-
         return x
-    
 class MultiAntennaTestDataset(Dataset):
     def __init__(self, root_dir, window_size=340, step_size=170):
         self.samples = []
-        self.label_map = {
-            'W': 0, 'R': 1, 'J': 2, 'L': 3, 'S': 4, 'C': 5, 'H': 6, 'G': 6
-        }
+        self.label_map = SHARED_LABEL_MAP
 
         print(f"Loading multi-antenna files from {root_dir}...")
         for root, _, files in os.walk(root_dir):
@@ -156,8 +151,7 @@ class MultiAntennaTestDataset(Dataset):
         return processed_tensors[0], processed_tensors[1], \
                processed_tensors[2], processed_tensors[3], \
                torch.tensor(label, dtype=torch.long)
-    
-# --- 1. Define Subject Groups for Independent Evaluation ---
+""" # --- 1. Define Subject Groups for Independent Evaluation ---
 # S1-S5: Training (Multiple environments/people)
 # S6: Validation (Checking performance on a new person during training)
 # S7: Testing (The ultimate "Independent" test as per the paper)
@@ -165,11 +159,7 @@ train_subs = ['S1', 'S2', 'S3', 'S4', 'S5']
 val_subs   = ['S6']
 test_subs  = ['S7']
 
-# --- 2. Create a "Normalization Only" transform for Val/Test ---
-# We want Val/Test to be normalized like Train, but NOT masked/noisy.
-class NormalizeOnly:
-    def __call__(self, x):
-        return (x - np.mean(x)) / (np.std(x) + 1e-8)
+
 
 # --- 3. Initialize the Datasets Independently ---
 # Note: We apply WirelessAugment ONLY to the training set.
@@ -199,49 +189,60 @@ test_loader  = DataLoader(test_dataset, batch_size=128, shuffle=False)
 print(f"--- Dataset Split Summary ---")
 print(f"Train (S1-S5): {len(train_dataset)} windows | Batches: {len(train_loader)}")
 print(f"Val   (S6):    {len(val_dataset)} windows | Batches: {len(val_loader)}")
-print(f"Test  (S7):    {len(test_dataset)} windows | Batches: {len(test_loader)}")
+print(f"Test  (S7):    {len(test_dataset)} windows | Batches: {len(test_loader)}") """
 
 class BaseLineModel(nn.Module):
-    def __init__(self, num_classes = 7):
-
+    def __init__(self, num_classes=8, dropout=0.2):
         super().__init__()
         
+        # Branch 1: Spatial Reduction
         self.branch1 = nn.MaxPool2d(kernel_size=2, stride=2)
 
-        self.branch2 = nn.Sequential(nn.Conv2d(in_channels=1, out_channels=5, kernel_size=2, stride=2),
-                                     nn.ReLU()
-                                     )
+        # Branch 2: Simple Feature Extraction
+        self.branch2 = nn.Sequential(
+            nn.Conv2d(in_channels=1, out_channels=5, kernel_size=2, stride=2),
+            nn.BatchNorm2d(5),
+            nn.ReLU()
+        )
         
-        self.branch3 = nn.Sequential(nn.Conv2d(in_channels=1, out_channels=3, kernel_size=1, stride=1),
-                                     nn.ReLU(),
-                                     nn.Conv2d(in_channels=3, out_channels=6, kernel_size=2, stride=1, padding="same"),
-                                     nn.ReLU(),
-                                     nn.Conv2d(in_channels=6, out_channels=9, kernel_size=4, stride=2, padding=1),
-                                     nn.ReLU()
-                                     )
+        # Branch 3: Multi-scale Feature Extraction (from SHARP paper)
+        self.branch3 = nn.Sequential(
+            nn.Conv2d(in_channels=1, out_channels=3, kernel_size=1, stride=1),
+            nn.BatchNorm2d(3),
+            nn.ReLU(),
+            nn.Conv2d(in_channels=3, out_channels=6, kernel_size=2, stride=1, padding=1), # padding to keep size
+            nn.BatchNorm2d(6),
+            nn.ReLU(),
+            nn.Conv2d(in_channels=6, out_channels=9, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm2d(9),
+            nn.ReLU()
+        )
         
-        self.concat_conv = nn.Sequential(nn.Conv2d(in_channels=15, out_channels=3, kernel_size=1, stride=1),
-                                         nn.ReLU())
+        # Branch 1 output (1 channel) + Branch 2 (5 channels) + Branch 3 (9 channels) = 15 channels
+        self.concat_conv = nn.Sequential(
+            nn.Conv2d(in_channels=15, out_channels=3, kernel_size=1, stride=1),
+            nn.BatchNorm2d(3),
+            nn.ReLU()
+        )
         
         self.flatten = nn.Flatten()
-        self.dropout = nn.Dropout(0.2)
+        self.dropout = nn.Dropout(dropout)
+        # Assuming 340x100 input -> after stride 2 branches -> 170x50
         self.dense = nn.Linear(3 * 170 * 50, num_classes)
     
     def forward(self, x):
-
         out1 = self.branch1(x)
         out2 = self.branch2(x)
         out3 = self.branch3(x)
-
+        
+        # Ensure all branches have the same spatial dimensions before concat
+        # (Slight resizing might be needed if window size isn't perfectly divisible)
         x = torch.cat([out1, out2, out3], dim=1)
-
         x = self.concat_conv(x)
         x = self.flatten(x)
         x = self.dropout(x)
         x = self.dense(x)
-
         return x
-    
 def sharp_decision_fusion(logits_list):
     """
     logits_list: A list of 4 tensors, each of shape [batch_size, num_classes]
@@ -273,8 +274,20 @@ def sharp_decision_fusion(logits_list):
             final_preds.append(torch.argmax(summed_logits).item())
             
     return torch.tensor(final_preds, device=logits_list[0].device)
-
-import torch.optim as optim
+def soft_decision_fusion(logits_list):
+    """
+    Implements the Fusion approach from SHARP Section 4.2 & 6.4.
+    Sums the raw logits to preserve the 'confidence' of each antenna.
+    """
+    # Stack: [4, batch_size, num_classes]
+    stacked_logits = torch.stack(logits_list) 
+    
+    # Sum across the 4 antennas: [batch_size, num_classes]
+    summed_logits = torch.sum(stacked_logits, dim=0)
+    
+    # Final prediction is the highest sum
+    return torch.argmax(summed_logits, dim=1)
+""" import torch.optim as optim
 from tqdm import tqdm # Optional: for progress bars
 
 # 1. Device Configuration
@@ -282,9 +295,9 @@ device = torch.device("mps" if torch.backends.mps.is_available() else "cuda" if 
 print(f"Using device: {device}")
 
 # 2. Initialize Model, Loss, and Optimizer
-model = BaseLineModel(num_classes=7).to(device)
+model = BaseLineModel(num_classes=8).to(device)
 criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.parameters(), lr=0.001)
+optimizer = optim.Adam(model.parameters(), lr=0.005)
 
 # To help the model converge better on augmented data
 scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=2)
@@ -295,7 +308,7 @@ history = {
 }
 
 best_val_acc = 0.0
-num_epochs = 5 # Increase this if using Augmentation, as it takes longer to learn
+num_epochs = 3 # Increase this if using Augmentation, as it takes longer to learn
 
 print("Starting Training...")
 
@@ -399,4 +412,260 @@ with torch.no_grad():
 
 test_acc = test_correct / test_total
 print(f"\nFINAL RESULT:")
-print(f"SHARP Fusion Test Accuracy (Subject 7): {test_acc:.4f} ({test_acc * 100:.2f}%)")
+print(f"SHARP Fusion Test Accuracy (Subject 7): {test_acc:.4f} ({test_acc * 100:.2f}%)") """
+import pytorch_lightning as L
+import torch.nn.functional as F
+import torch.optim as optim
+# We want Val/Test to be normalized like Train, but NOT masked/noisy.
+class NormalizeOnly:
+    def __call__(self, x):
+        return (x - np.mean(x)) / (np.std(x) + 1e-8)
+class OPERAnetDataModule(L.LightningDataModule):
+    def __init__(self, root_dir, batch_size=64):
+        super().__init__()
+        self.root_dir = root_dir
+        self.batch_size = batch_size
+        # Step 1 logic: Subject Splits
+        self.train_subs = ['S1', 'S2', 'S3', 'S4', 'S5']
+        self.val_subs = ['S6']
+        self.test_subs = ['S7']
+
+    def setup(self, stage=None):
+        if stage == "fit" or stage is None:
+            self.train_ds = OPERAnetDataset(
+                self.root_dir, subjects_to_include=self.train_subs,
+                transform=transforms.Compose([NormalizeOnly(), WirelessAugment(p=0.8)]) # Strong augmentation
+            )
+            self.val_ds = OPERAnetDataset(
+                self.root_dir, subjects_to_include=self.val_subs,
+                transform=NormalizeOnly()
+            )
+        if stage == "test":
+            # Uses the Multi-Antenna class for the SHARP fusion test
+            self.test_ds = MultiAntennaTestDataset(root_dir=f"{self.root_dir}/S7a")
+
+    def train_dataloader(self):
+        return DataLoader(
+        self.train_ds, 
+        batch_size=self.batch_size, 
+        shuffle=True, 
+        num_workers=0, # Adjust based on your CPU cores
+        pin_memory=False
+    )
+
+    def val_dataloader(self):
+        return DataLoader(self.val_ds, batch_size=self.batch_size, num_workers=0)
+
+    def test_dataloader(self):
+        return DataLoader(self.test_ds, batch_size=self.batch_size)
+import torch.nn.functional as F
+import torchmetrics
+
+class LitSHARP(L.LightningModule):
+    def __init__(self, num_classes=8, lr=1e-3, dropout=0.2, weight_decay=1e-4):
+        super().__init__()
+        self.save_hyperparameters() # Important for Optuna!
+        self.model = BaseLineModel(num_classes=num_classes)
+        # Update dropout dynamically for Optuna tuning
+        self.model.dropout = torch.nn.Dropout(dropout)
+        
+        self.train_acc = torchmetrics.Accuracy(task="multiclass", num_classes=num_classes)
+        self.val_acc = torchmetrics.Accuracy(task="multiclass", num_classes=num_classes)
+        self.test_preds = []
+        self.test_labels = []
+
+    def forward(self, x):
+        return self.model(x)
+
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+        logits = self(x)
+        loss = F.cross_entropy(logits, y)
+        self.train_acc(logits, y)
+        self.log("train_loss", loss, prog_bar=True)
+        self.log("train_acc", self.train_acc, prog_bar=True)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        x, y = batch
+        logits = self(x)
+        loss = F.cross_entropy(logits, y)
+        self.val_acc(logits, y)
+        self.log("val_loss", loss, prog_bar=True)
+        self.log("val_acc", self.val_acc, prog_bar=True)
+
+    def test_step(self, batch, batch_idx):
+        # Unpack the 4 antenna streams from MultiAntennaTestDataset
+        x1, x2, x3, x4, y = batch
+        
+        # Get logits for all 4
+        logits = self(x1), self(x2), self(x3), self(x4)
+        
+        # Apply the SHARP Fusion logic we defined earlier
+        # Note: sharp_decision_fusion must be accessible here
+        
+        # preds = sharp_decision_fusion([l1, l2, l3, l4])
+        preds = soft_decision_fusion(logits)
+        self.test_preds.extend(preds.cpu().numpy())
+        self.test_labels.extend(y.cpu().numpy())
+
+        acc = (preds == y).float().mean()
+        self.log("test_fusion_acc", acc)
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.lr, weight_decay=self.hparams.weight_decay)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='max', factor=0.5, patience=2
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "monitor": "val_acc"}
+        }
+import optuna
+from optuna.integration import PyTorchLightningPruningCallback
+
+def objective(trial):
+    # 1. Suggest Hyperparameters
+    lr = trial.suggest_float("lr", 1e-5, 1e-2, log=True)
+    dropout = trial.suggest_float("dropout", 0.2, 0.5)
+    batch_size = trial.suggest_categorical("batch_size", [128, 256])
+    weight_decay = trial.suggest_float("weight_decay",1e-6, 1e-2, log=True )
+    # 2. Setup Lightning components
+    model = LitSHARP(num_classes=8, lr=lr, dropout=dropout, weight_decay = weight_decay)
+    datamodule = OPERAnetDataModule(root_dir="doppler_traces", batch_size=batch_size)
+
+    # 3. Setup Trainer (Use a short run for tuning) find hyperparameters
+    trainer = L.Trainer(
+        num_sanity_val_steps=0,
+        max_epochs=10,
+        accelerator="auto",
+        devices=1,
+        logger=False, # Disable logging for speed during tuning
+        enable_checkpointing=False,
+        callbacks=[PyTorchLightningPruningCallback(trial, monitor="val_acc")],
+        precision="16-mixed"
+        
+    )
+
+    # 4. Train and return the metric for Optuna to maximize
+    trainer.fit(model, datamodule=datamodule)
+    return trainer.callback_metrics["val_acc"].item()
+
+
+from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping
+import matplotlib.pyplot as plt
+from lightning.pytorch.loggers import CSVLogger
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+import seaborn as sns
+
+if __name__ == "__main__":
+    # To run tuning:
+    study = optuna.create_study(direction="maximize", pruner=optuna.pruners.MedianPruner())
+    study.optimize(objective, n_trials=15)
+
+    # 1. Setup Data
+    dm = OPERAnetDataModule(root_dir="doppler_traces", batch_size=study.best_params["batch_size"])
+
+    # 2. Setup Model 
+    # (You can pass hyperparams here for Optuna later)
+    model = LitSHARP(
+        num_classes=8, 
+        lr=study.best_params["lr"], 
+        dropout=study.best_params["dropout"],
+        weight_decay=study.best_params["weight_decay"]
+    )
+
+    # 3. Setup Callbacks (Replaces your manual "Best Model" logic)
+    checkpoint_callback = ModelCheckpoint(
+        monitor="val_acc",
+        dirpath="checkpoints",
+        filename="best-sharp",
+        mode="max",
+        save_top_k=1
+    )
+    logger = CSVLogger("logs", name="sharp_experiment")
+    # 4. The Trainer (Replaces your loops, device config, and tqdm) find parameters
+    trainer = L.Trainer(
+        num_sanity_val_steps=0,
+        max_epochs=30,           # Set your epochs here
+        accelerator="auto",      # Auto-detects MPS, CUDA, or CPU
+        devices=1,               # Number of GPUs/Chips
+        callbacks=[checkpoint_callback, EarlyStopping(monitor="val_acc", patience=5)],
+        precision="16-mixed",     # Optional: Faster training on modern GPUs
+        logger=logger
+    )
+
+    # 5. START TRAINING
+    trainer.fit(model, datamodule=dm)
+    log_path = f"{logger.log_dir}/metrics.csv"
+    metrics = pd.read_csv(log_path)
+    # 3. Plot
+    plt.figure(figsize=(12, 5))
+    plt.subplot(1, 2, 1)
+    sns.lineplot(data=metrics, x='epoch', y='train_loss', label='Train Loss')
+    sns.lineplot(data=metrics, x='epoch', y='val_loss', label='Val Loss')
+    plt.title("Loss History")
+
+    plt.subplot(1, 2, 2)
+    sns.lineplot(data=metrics, x='epoch', y='train_acc', label='Train Acc')
+    sns.lineplot(data=metrics, x='epoch', y='val_acc', label='Val Acc')
+    plt.title("Accuracy History")
+    plt.show()
+    # 6. START TESTING (Replaces your manual Fusion loop)
+    # This automatically loads the BEST checkpoint from the training phase
+    trainer.test(model, datamodule=dm, ckpt_path="best")
+def plot_confusion_matrix(true_labels, pred_labels):
+    activity_names = ['Empty', 'Walk', 'Run', 'Jump', 'Sit', 'Stand', 'Sit/Stand', 'Gym']
+    
+    cm = confusion_matrix(true_labels, pred_labels)
+    
+    # Normalize the matrix (percentages)
+    cm_perc = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+    
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cm_perc, annot=True, fmt='.2f', cmap='Blues',
+                xticklabels=activity_names, yticklabels=activity_names)
+    plt.title('Normalized Confusion Matrix: Subject 7 (Fusion)')
+    plt.xlabel('Predicted Label')
+    plt.ylabel('True Label')
+    plt.show()
+
+plot_confusion_matrix(model.test_labels, model.test_preds)
+def plot_sample_activities(dataset, label_map):
+    # Invert the map to get {ID: Name}
+    inv_map = {v: k for k, v in label_map.items()}
+    activity_names = {
+        0: 'Empty', 1: 'Walking', 2: 'Running', 3: 'Jumping',
+        4: 'Sitting', 5: 'Standing', 6: 'Sit/Stand', 7: 'Gym'
+    }
+    
+    found_classes = set()
+    plt.figure(figsize=(20, 10))
+    
+    count = 0
+    # Search for one example of each class
+    for i in range(len(dataset)):
+        x, y = dataset[i]
+        label = y.item()
+        if label not in found_classes:
+            found_classes.add(label)
+            count += 1
+            
+            plt.subplot(2, 4, count)
+            # Remove channel dim and plot
+            plt.imshow(x.squeeze().numpy().T, aspect='auto', origin='lower', cmap='jet')
+            plt.title(f"Class {label}: {activity_names[label]}")
+            plt.xlabel("Time")
+            plt.ylabel("Velocity Bin")
+            
+            if len(found_classes) == 8: break
+            
+    plt.tight_layout()
+    plt.show()
+# Initialize data
+dm = OPERAnetDataModule(root_dir="doppler_traces")
+dm.setup() # Manual setup call to initialize the internal datasets
+
+# Use the function from before
+# SHARED_LABEL_MAP is the dictionary we defined earlier
+plot_sample_activities(dm.train_ds, SHARED_LABEL_MAP)
