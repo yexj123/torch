@@ -1,4 +1,4 @@
-## 🧠 The Standard PyTorch Deep Learning Workflow
+## The Standard PyTorch Deep Learning Workflow
 
 General standard PyTorch steps to follow (I am just following these steps for my housing.ipynb).
 
